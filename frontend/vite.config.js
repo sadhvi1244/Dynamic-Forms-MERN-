@@ -9,7 +9,7 @@ export default defineConfig({
     open: true,
     proxy: {
       "/api": {
-        target: "http://localhost:5000",
+        target: "https://dynamic-forms-backend-wine.vercel.app",
         changeOrigin: true,
         secure: false,
       },

@@ -101,7 +101,7 @@ const DynamicFormSystem = () => {
         sortOrder: "desc",
       };
 
-      const response = await apiService.searchEntities(selectedEntity, params);
+      const response = await apiService.getEntities(selectedEntity, params);
 
       if (response.success) {
         setData(response.data || []);
