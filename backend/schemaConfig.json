@@ -1,0 +1,49 @@
+{
+  "record": {
+    "projects": {
+      "route": "/api/projects",
+      "backend": {
+        "schema": {
+          "name": { "type": "String", "required": true },
+          "description": { "type": "String", "required": false },
+          "status": {
+            "type": "String",
+            "enum": ["ACTIVE", "INACTIVE"],
+            "default": "ACTIVE"
+          }
+        },
+        "options": {
+          "timestamps": true
+        }
+      },
+      "frontend": {
+        "apiPath": "/projects",
+        "title": "Projects",
+        "fields": [
+          {
+            "name": "name",
+            "label": "Project Name",
+            "type": "text",
+            "required": true
+          },
+          {
+            "name": "description",
+            "label": "Description",
+            "type": "textarea"
+          },
+          {
+            "name": "status",
+            "label": "Status",
+            "type": "dropdown",
+            "options": ["ACTIVE", "INACTIVE"]
+          }
+        ],
+        "columns": [
+          { "header": "Name", "accessor": "name" },
+          { "header": "Description", "accessor": "description" },
+          { "header": "Status", "accessor": "status" }
+        ]
+      }
+    }
+  }
+}

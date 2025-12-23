@@ -7,47 +7,69 @@ import path from "path";
 import { fileURLToPath } from "url";
 import "dotenv/config";
 
-// ES6 module equivalents for __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Middleware
-app.use(cors());
+// ============================================
+// MIDDLEWARE SETUP
+// ============================================
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    credentials: true,
+  })
+);
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
 
-// MongoDB Connection
+// Request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// ============================================
+// MONGODB CONNECTION
+// ============================================
+const MONGODB_URI = process.env.MONGODB_URI;
 let isMongoConnected = false;
-const MONGODB_URI =
-  process.env.MONGODB_URI || "mongodb://localhost:27017/dynamicforms";
 
 if (MONGODB_URI) {
   mongoose
-    .connect(MONGODB_URI)
+    .connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    })
     .then(() => {
       console.log("✅ MongoDB Connected");
       isMongoConnected = true;
     })
     .catch((err) => {
-      console.warn("⚠️  MongoDB not available:", err.message);
-      console.log("⚠️  Running without database - using in-memory storage");
+      console.warn("⚠️ MongoDB connection failed:", err.message);
+      console.log("⚠️ Running without database");
     });
+} else {
+  console.warn("⚠️ MONGODB_URI not set, running without database");
 }
 
-// In-memory data store (fallback)
-const memoryStore = {};
-
-// Load initial schema configuration
+// ============================================
+// LOAD SCHEMA CONFIGURATION
+// ============================================
 let currentSchema;
+
 try {
-  // Try to load from file
   const schemaPath = path.join(__dirname, "schemaConfig.json");
+
   if (fs.existsSync(schemaPath)) {
     const schemaData = fs.readFileSync(schemaPath, "utf8");
     currentSchema = JSON.parse(schemaData);
-    console.log("✅ Schema configuration loaded from file");
+    console.log(
+      "✅ Schema loaded from file:",
+      Object.keys(currentSchema.record)
+    );
   } else {
     // Default schema
     currentSchema = {
@@ -81,234 +103,327 @@ try {
     console.log("✅ Using default schema");
   }
 } catch (error) {
-  console.error("❌ Error loading schema configuration:", error);
+  console.error("❌ Error loading schema:", error);
   currentSchema = { record: {} };
 }
 
-// Store for registered routes
-const registeredRoutes = {};
+// ============================================
+// IN-MEMORY STORAGE (FALLBACK)
+// ============================================
+const memoryStore = {};
 
-// Dynamic route generator
-const createRoutes = (entity, config) => {
+// ============================================
+// DYNAMIC MODEL CREATOR
+// ============================================
+const modelCache = {};
+
+const createDynamicModel = (entityName, config) => {
+  const modelName = entityName.charAt(0).toUpperCase() + entityName.slice(1);
+
+  // Return cached model
+  if (modelCache[modelName]) {
+    return modelCache[modelName];
+  }
+
+  // Delete existing model
+  if (mongoose.models[modelName]) {
+    delete mongoose.models[modelName];
+  }
+
+  const schemaFields = {};
+
+  for (const [fieldName, fieldConfig] of Object.entries(config.schema)) {
+    const field = {};
+
+    // Type mapping
+    switch (fieldConfig.type) {
+      case "String":
+        field.type = String;
+        break;
+      case "Number":
+        field.type = Number;
+        break;
+      case "Boolean":
+        field.type = Boolean;
+        break;
+      case "Date":
+        field.type = Date;
+        break;
+      case "Array":
+        field.type = Array;
+        break;
+      default:
+        field.type = String;
+    }
+
+    if (fieldConfig.required) field.required = true;
+    if (fieldConfig.unique) field.unique = true;
+    if (fieldConfig.default === "Date.now") field.default = Date.now;
+    else if (fieldConfig.default) field.default = fieldConfig.default;
+    if (fieldConfig.enum) field.enum = fieldConfig.enum;
+
+    schemaFields[fieldName] = field;
+  }
+
+  const schema = new mongoose.Schema(schemaFields, {
+    timestamps: true,
+    strict: false,
+  });
+
+  const model = mongoose.model(modelName, schema);
+  modelCache[modelName] = model;
+
+  console.log(`📦 Model created: ${modelName}`);
+  return model;
+};
+
+// ============================================
+// DYNAMIC ROUTES CREATOR
+// ============================================
+const createRoutes = (entityName, config, Model) => {
   const router = express.Router();
 
-  // GET all items with pagination
-  router.get("/", (req, res) => {
+  // GET all items
+  router.get("/", async (req, res) => {
     try {
-      const items = memoryStore[entity] || [];
       const { page = 1, limit = 10, search = "" } = req.query;
 
-      // Filter by search term
-      let filteredItems = items;
-      if (search) {
-        const searchLower = search.toLowerCase();
-        filteredItems = items.filter((item) => {
-          return Object.values(item).some((val) =>
-            String(val).toLowerCase().includes(searchLower)
+      if (isMongoConnected && Model) {
+        // Use MongoDB
+        let query = {};
+
+        if (search) {
+          const stringFields = Object.entries(config.schema)
+            .filter(([_, v]) => v.type === "String")
+            .map(([k]) => k);
+
+          if (stringFields.length > 0) {
+            query.$or = stringFields.map((field) => ({
+              [field]: { $regex: search, $options: "i" },
+            }));
+          }
+        }
+
+        const records = await Model.find(query)
+          .limit(parseInt(limit))
+          .skip((parseInt(page) - 1) * parseInt(limit))
+          .sort({ createdAt: -1 })
+          .lean();
+
+        const total = await Model.countDocuments(query);
+
+        res.json({
+          success: true,
+          data: records,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        });
+      } else {
+        // Use in-memory storage
+        const items = memoryStore[entityName] || [];
+        let filteredItems = items;
+
+        if (search) {
+          const searchLower = search.toLowerCase();
+          filteredItems = items.filter((item) =>
+            Object.values(item).some((val) =>
+              String(val).toLowerCase().includes(searchLower)
+            )
           );
+        }
+
+        const startIndex = (parseInt(page) - 1) * parseInt(limit);
+        const endIndex = parseInt(page) * parseInt(limit);
+        const paginatedItems = filteredItems.slice(startIndex, endIndex);
+
+        res.json({
+          success: true,
+          data: paginatedItems,
+          pagination: {
+            total: filteredItems.length,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(filteredItems.length / parseInt(limit)),
+          },
         });
       }
-
-      // Pagination
-      const startIndex = (page - 1) * limit;
-      const endIndex = page * limit;
-      const paginatedItems = filteredItems.slice(startIndex, endIndex);
-
-      res.json({
-        success: true,
-        data: paginatedItems,
-        pagination: {
-          total: filteredItems.length,
-          page: parseInt(page),
-          limit: parseInt(limit),
-          totalPages: Math.ceil(filteredItems.length / limit),
-        },
-      });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: error.message,
-      });
+      console.error(`Error fetching ${entityName}:`, error);
+      res.status(500).json({ success: false, error: error.message });
     }
   });
 
-  // GET single item
-  router.get("/:id", (req, res) => {
-    const items = memoryStore[entity] || [];
-    const item = items.find((i) => i._id === req.params.id);
-
-    if (!item) {
-      return res.status(404).json({
-        success: false,
-        error: "Item not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      data: item,
-    });
-  });
-
-  // POST create item
-  router.post("/", (req, res) => {
+  // GET by ID
+  router.get("/:id", async (req, res) => {
     try {
-      const items = memoryStore[entity] || [];
-      const newItem = {
-        _id: Date.now().toString(),
-        ...req.body,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      items.push(newItem);
-      memoryStore[entity] = items;
-
-      res.status(201).json({
-        success: true,
-        data: newItem,
-        message: `${entity} created successfully`,
-      });
-    } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: error.message,
-      });
-    }
-  });
-
-  // PUT update item
-  router.put("/:id", (req, res) => {
-    try {
-      let items = memoryStore[entity] || [];
-      const index = items.findIndex((i) => i._id === req.params.id);
-
-      if (index === -1) {
-        return res.status(404).json({
-          success: false,
-          error: "Item not found",
-        });
+      if (isMongoConnected && Model) {
+        const record = await Model.findById(req.params.id).lean();
+        if (!record) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        res.json({ success: true, data: record });
+      } else {
+        const items = memoryStore[entityName] || [];
+        const item = items.find((i) => i._id === req.params.id);
+        if (!item) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        res.json({ success: true, data: item });
       }
-
-      items[index] = {
-        ...items[index],
-        ...req.body,
-        updatedAt: new Date().toISOString(),
-      };
-
-      memoryStore[entity] = items;
-
-      res.json({
-        success: true,
-        data: items[index],
-        message: `${entity} updated successfully`,
-      });
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: error.message,
-      });
+      res.status(500).json({ success: false, error: error.message });
     }
   });
 
-  // DELETE item
-  router.delete("/:id", (req, res) => {
+  // POST create
+  router.post("/", async (req, res) => {
     try {
-      let items = memoryStore[entity] || [];
-      const filtered = items.filter((i) => i._id !== req.params.id);
-
-      if (filtered.length === items.length) {
-        return res.status(404).json({
-          success: false,
-          error: "Item not found",
-        });
+      if (isMongoConnected && Model) {
+        const newRecord = new Model(req.body);
+        const saved = await newRecord.save();
+        res.status(201).json({ success: true, data: saved });
+      } else {
+        const items = memoryStore[entityName] || [];
+        const newItem = {
+          _id: Date.now().toString(),
+          ...req.body,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        items.push(newItem);
+        memoryStore[entityName] = items;
+        res.status(201).json({ success: true, data: newItem });
       }
-
-      memoryStore[entity] = filtered;
-
-      res.json({
-        success: true,
-        message: `${entity} deleted successfully`,
-      });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: error.message,
-      });
+      console.error(`Error creating ${entityName}:`, error);
+      res.status(400).json({ success: false, error: error.message });
+    }
+  });
+
+  // PUT update
+  router.put("/:id", async (req, res) => {
+    try {
+      if (isMongoConnected && Model) {
+        const updated = await Model.findByIdAndUpdate(req.params.id, req.body, {
+          new: true,
+          runValidators: true,
+        }).lean();
+        if (!updated) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        res.json({ success: true, data: updated });
+      } else {
+        let items = memoryStore[entityName] || [];
+        const index = items.findIndex((i) => i._id === req.params.id);
+        if (index === -1) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        items[index] = {
+          ...items[index],
+          ...req.body,
+          updatedAt: new Date().toISOString(),
+        };
+        memoryStore[entityName] = items;
+        res.json({ success: true, data: items[index] });
+      }
+    } catch (error) {
+      res.status(400).json({ success: false, error: error.message });
+    }
+  });
+
+  // DELETE
+  router.delete("/:id", async (req, res) => {
+    try {
+      if (isMongoConnected && Model) {
+        const deleted = await Model.findByIdAndDelete(req.params.id).lean();
+        if (!deleted) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        res.json({ success: true, message: "Deleted successfully" });
+      } else {
+        let items = memoryStore[entityName] || [];
+        const filtered = items.filter((i) => i._id !== req.params.id);
+        if (filtered.length === items.length) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        memoryStore[entityName] = filtered;
+        res.json({ success: true, message: "Deleted successfully" });
+      }
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
     }
   });
 
   return router;
 };
 
-// Function to register all routes
+// ============================================
+// REGISTER ALL ROUTES
+// ============================================
+const registeredRoutes = {};
+
 const registerAllRoutes = () => {
   console.log("\n🔄 Registering routes...");
 
-  // Clear previously registered routes
-  Object.values(registeredRoutes).forEach((route) => {
-    // Remove the route from Express
-    // This is a simplified approach - in production, you'd need proper route management
-  });
-
-  // Clear the registered routes object
-  Object.keys(registeredRoutes).forEach((key) => {
-    delete registeredRoutes[key];
-  });
+  // Clear previous routes
+  Object.keys(registeredRoutes).forEach((key) => delete registeredRoutes[key]);
 
   // Register new routes
   Object.entries(currentSchema.record).forEach(([entityName, config]) => {
     try {
       if (!config.route || !config.backend) {
-        console.warn(`⚠️  Skipping ${entityName}: Invalid configuration`);
+        console.warn(`⚠️ Skipping ${entityName}: Invalid configuration`);
         return;
       }
 
-      const router = createRoutes(entityName, config);
+      let Model = null;
+      if (isMongoConnected) {
+        Model = createDynamicModel(entityName, config.backend);
+      }
+
+      const router = createRoutes(entityName, config.backend, Model);
       app.use(config.route, router);
       registeredRoutes[entityName] = config.route;
-      console.log(`✅ Registered: ${config.route} -> ${entityName}`);
+      console.log(`✅ ${config.route} -> ${entityName}`);
     } catch (error) {
       console.error(`❌ Error registering ${entityName}:`, error.message);
     }
   });
 
-  console.log(
-    `📋 Total routes registered: ${Object.keys(registeredRoutes).length}\n`
-  );
+  console.log(`📋 Total routes: ${Object.keys(registeredRoutes).length}\n`);
 };
 
-// Initial route registration
+// Initial registration
 registerAllRoutes();
 
 // ============================================
 // SYSTEM ROUTES
 // ============================================
-
-// Root endpoint
 app.get("/", (req, res) => {
   res.json({
-    message: "Dynamic Form System API",
-    status: "running",
+    message: "🎯 Dynamic Form System API",
     version: "1.0.0",
-    database: isMongoConnected ? "connected" : "in-memory",
+    status: "running",
+    database: isMongoConnected ? "MongoDB" : "In-memory",
     entities: Object.keys(currentSchema.record),
-    availableRoutes: Object.values(currentSchema.record).map((c) => c.route),
+    routes: Object.values(registeredRoutes),
   });
 });
 
-// Health check endpoint
 app.get("/health", (req, res) => {
   res.json({
     status: "OK",
     timestamp: new Date().toISOString(),
     database: isMongoConnected ? "connected" : "in-memory",
-    entities: Object.keys(currentSchema.record).length,
-    routes: Object.values(currentSchema.record).map((c) => c.route),
+    entities: Object.keys(currentSchema.record),
+    routes: Object.values(registeredRoutes),
   });
 });
 
-// GET current schema
 app.get("/api/schema", (req, res) => {
   res.json({
     success: true,
@@ -317,94 +432,49 @@ app.get("/api/schema", (req, res) => {
   });
 });
 
-// POST update schema dynamically
 app.post("/api/schema/update", (req, res) => {
   try {
     const newSchema = req.body;
 
-    console.log("\n🔄 Schema update request received...");
-
-    // Basic validation
     if (!newSchema.record || typeof newSchema.record !== "object") {
       throw new Error('Schema must contain a "record" object');
     }
 
-    // Update schema
     currentSchema = newSchema;
 
-    // Save to file for persistence
+    // Save to file
     try {
       const schemaPath = path.join(__dirname, "schemaConfig.json");
       fs.writeFileSync(schemaPath, JSON.stringify(newSchema, null, 2), "utf8");
-      console.log("✅ Schema saved to schemaConfig.json");
+      console.log("✅ Schema saved to file");
     } catch (fileError) {
-      console.warn("⚠️  Could not save schema to file:", fileError.message);
+      console.warn("⚠️ Could not save schema:", fileError.message);
     }
 
-    // Re-register all routes with new schema
-    registerAllRoutes();
+    // Clear model cache
+    Object.keys(modelCache).forEach((key) => delete modelCache[key]);
 
-    const entities = Object.keys(newSchema.record);
-    console.log(
-      `✅ Schema updated successfully with ${entities.length} entities`
-    );
+    // Re-register routes
+    registerAllRoutes();
 
     res.json({
       success: true,
       message: "Schema updated successfully",
-      data: {
-        entities: entities,
-        count: entities.length,
-        routes: Object.values(newSchema.record).map((c) => c.route),
-        timestamp: new Date().toISOString(),
-      },
+      entities: Object.keys(newSchema.record),
+      routes: Object.values(registeredRoutes),
     });
   } catch (error) {
-    console.error("❌ Error updating schema:", error);
-    res.status(400).json({
-      success: false,
-      error: error.message,
-    });
+    console.error("❌ Schema update error:", error);
+    res.status(400).json({ success: false, error: error.message });
   }
 });
 
-// Debug endpoint to see all routes
-app.get("/api/debug/routes", (req, res) => {
-  const routes = [];
-
-  function getRoutes(layer, prefix = "") {
-    if (layer.route) {
-      const path = prefix + layer.route.path;
-      const methods = Object.keys(layer.route.methods);
-      routes.push({ path, methods });
-    } else if (layer.name === "router" && layer.handle.stack) {
-      layer.handle.stack.forEach((stackItem) => {
-        getRoutes(
-          stackItem,
-          prefix + (layer.regexp.toString() !== "/(?:)/" ? layer.path : "")
-        );
-      });
-    }
-  }
-
-  app._router.stack.forEach((layer) => {
-    getRoutes(layer);
-  });
-
-  res.json({
-    registeredRoutes: Object.values(registeredRoutes),
-    allRoutes: routes,
-    schemaEntities: Object.keys(currentSchema.record || {}),
-    memoryStoreEntities: Object.keys(memoryStore),
-  });
-});
-
-// 404 handler for undefined routes
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     success: false,
-    error: `Route not found: ${req.method} ${req.originalUrl}`,
-    availableRoutes: Object.values(currentSchema.record).map((c) => c.route),
+    error: `Route not found: ${req.method} ${req.path}`,
+    availableRoutes: Object.values(registeredRoutes),
   });
 });
 
@@ -418,16 +488,19 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ============================================
+// START SERVER
+// ============================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log("\n══════════════════════════════════════════════════════════");
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
-  console.log(`💾 Database: ${isMongoConnected ? "MongoDB" : "In-memory"}`);
-  console.log(
-    `📋 Entities: ${Object.keys(currentSchema.record).join(", ") || "None"}`
-  );
-  console.log("══════════════════════════════════════════════════════════\n");
-});
+
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log("\n══════════════════════════════════════════");
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`💾 Database: ${isMongoConnected ? "MongoDB" : "In-memory"}`);
+    console.log(`📋 Entities: ${Object.keys(currentSchema.record).join(", ")}`);
+    console.log("══════════════════════════════════════════\n");
+  });
+}
 
 export default app;
