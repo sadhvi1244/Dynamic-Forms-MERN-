@@ -46,7 +46,18 @@ const connectDB = async () => {
 
 /* -------------------- Schema Config -------------------- */
 let schemaConfig = {
-  /* 🔹 YOUR EXISTING SCHEMA (UNCHANGED) 🔹 */
+  record: {
+    customers: {
+      route: "/api/customers",
+      backend: {
+        schema: {
+          name: { type: "String", required: true },
+          email: { type: "String", required: true, unique: true },
+          phone: { type: "String" },
+        },
+      },
+    },
+  },
 };
 
 /* -------------------- Model Cache -------------------- */
@@ -111,6 +122,23 @@ const createRoutes = (entity, config, Model) => {
     }
   });
 
+  // Add the missing PUT route for updates
+  router.put("/:id", async (req, res) => {
+    try {
+      await connectDB();
+      const doc = await Model.findByIdAndUpdate(req.params.id, req.body, {
+        new: true,
+        runValidators: true,
+      });
+      if (!doc) {
+        return res.status(404).json({ success: false, error: "Not found" });
+      }
+      res.json({ success: true, data: doc });
+    } catch (e) {
+      res.status(400).json({ success: false, error: e.message });
+    }
+  });
+
   return router;
 };
 
@@ -118,26 +146,38 @@ const createRoutes = (entity, config, Model) => {
 Object.entries(schemaConfig.record).forEach(([name, cfg]) => {
   const Model = createModel(name, cfg.backend);
   app.use(cfg.route, createRoutes(name, cfg.backend, Model));
+  console.log(`✅ Registered route: ${cfg.route}`);
 });
 
 /* -------------------- System Routes -------------------- */
 app.get("/", (req, res) => {
-  res.json({ status: "running" });
+  res.json({ status: "running", message: "Dynamic Forms API" });
 });
 
 app.get("/health", async (req, res) => {
   try {
     await connectDB();
-    res.json({ status: "OK", db: "connected" });
+    res.json({
+      status: "OK",
+      db: "connected",
+      timestamp: new Date().toISOString(),
+    });
   } catch (e) {
     res.status(503).json({ status: "ERROR", error: e.message });
   }
 });
 
+/* -------------------- Error Handling -------------------- */
+app.use((req, res, next) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res
+    .status(500)
+    .json({ error: "Internal server error", message: err.message });
+});
+
 /* -------------------- Export for Vercel -------------------- */
 export default app;
-
-/* -------------------- Local Dev Only -------------------- */
-if (process.env.NODE_ENV !== "production") {
-  app.listen(5000, () => console.log("🚀 Local server running on port 5000"));
-}
