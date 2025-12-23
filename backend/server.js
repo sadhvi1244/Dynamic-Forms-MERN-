@@ -15,9 +15,7 @@ let isMongoConnected = false;
 
 if (process.env.MONGODB_URI) {
   mongoose
-    .connect(
-      process.env.MONGODB_URI || "mongodb://localhost:27017/dynamicforms"
-    )
+    .connect(process.env.MONGODB_URI)
     .then(() => {
       console.log("✅ MongoDB Connected");
       isMongoConnected = true;

@@ -1,6 +1,7 @@
 import axios from "axios";
 
-import.meta.env.VITE_URL || "https://dynamic-forms-backend-wine.vercel.app";
+const API_BASE_URL =
+  import.meta.env.VITE_URL || "https://dynamic-forms-backend-wine.vercel.app";
 
 // Create axios instance
 const api = axios.create({
