@@ -1,124 +1,272 @@
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
+import bodyParser from "body-parser";
+import "dotenv/config";
 
 const app = express();
 
-/* ---------- Middleware ---------- */
-app.use(express.json({ limit: "50mb" }));
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "DELETE"],
-  })
-);
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-/* ---------- MongoDB (Vercel Safe) ---------- */
-const MONGODB_URI = process.env.MONGODB_URI;
+// MongoDB Connection (optional - will work even without MongoDB)
+let isMongoConnected = false;
 
-if (!MONGODB_URI) {
-  throw new Error("❌ MONGODB_URI missing");
-}
-
-let cached = global.mongoose;
-
-if (!cached) {
-  cached = global.mongoose = { conn: null, promise: null };
-}
-
-async function connectDB() {
-  if (cached.conn) return cached.conn;
-
-  if (!cached.promise) {
-    cached.promise = mongoose.connect(MONGODB_URI, {
-      bufferCommands: false,
-      serverSelectionTimeoutMS: 5000,
+if (process.env.MONGODB_URI) {
+  mongoose
+    .connect(
+      process.env.MONGODB_URI || "mongodb://localhost:27017/dynamicforms"
+    )
+    .then(() => {
+      console.log("✅ MongoDB Connected");
+      isMongoConnected = true;
+    })
+    .catch((err) => {
+      console.warn("⚠️  MongoDB not available:", err.message);
+      console.log("⚠️  Running without database - using in-memory storage");
     });
-  }
-
-  cached.conn = await cached.promise;
-  console.log("✅ MongoDB connected");
-  return cached.conn;
 }
 
-/* ---------- USER SCHEMA ---------- */
-const userSchema = new mongoose.Schema(
-  {
-    username: { type: String, required: true },
-    email: { type: String, required: true, unique: true },
-    role: { type: String, required: true },
-  },
-  { timestamps: true }
-);
+// In-memory data store (fallback)
+const memoryStore = {};
 
-const User = mongoose.models.User || mongoose.model("User", userSchema);
+// Dynamic route generator
+const createRoutes = (entity, schema) => {
+  const router = express.Router();
 
-/* ---------- ROUTES ---------- */
-app.get("/api/users", async (req, res) => {
-  try {
-    await connectDB();
-    const users = await User.find().lean();
-    res.json({ success: true, data: users });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/api/users", async (req, res) => {
-  try {
-    await connectDB();
-    const user = await User.create(req.body);
-    res.status(201).json({ success: true, data: user });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.put("/api/users/:id", async (req, res) => {
-  try {
-    await connectDB();
-    const user = await User.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-      runValidators: true,
+  // GET all items
+  router.get("/", (req, res) => {
+    const items = memoryStore[entity] || [];
+    res.json({
+      success: true,
+      data: items,
+      count: items.length,
     });
+  });
 
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
+  // GET single item
+  router.get("/:id", (req, res) => {
+    const items = memoryStore[entity] || [];
+    const item = items.find((i) => i._id === req.params.id);
+
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        error: "Item not found",
+      });
     }
 
-    res.json({ success: true, data: user });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.delete("/api/users/:id", async (req, res) => {
-  try {
-    await connectDB();
-    await User.findByIdAndDelete(req.params.id);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-/* ---------- Health ---------- */
-app.get("/health", async (req, res) => {
-  try {
-    await connectDB();
     res.json({
-      status: "OK",
-      db: "connected",
-      time: new Date().toISOString(),
+      success: true,
+      data: item,
     });
-  } catch (e) {
-    res.status(503).json({ status: "ERROR", error: e.message });
+  });
+
+  // POST create item
+  router.post("/", (req, res) => {
+    const items = memoryStore[entity] || [];
+    const newItem = {
+      _id: Date.now().toString(),
+      ...req.body,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    items.push(newItem);
+    memoryStore[entity] = items;
+
+    res.status(201).json({
+      success: true,
+      data: newItem,
+    });
+  });
+
+  // PUT update item
+  router.put("/:id", (req, res) => {
+    let items = memoryStore[entity] || [];
+    const index = items.findIndex((i) => i._id === req.params.id);
+
+    if (index === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Item not found",
+      });
+    }
+
+    items[index] = {
+      ...items[index],
+      ...req.body,
+      updatedAt: new Date().toISOString(),
+    };
+
+    memoryStore[entity] = items;
+
+    res.json({
+      success: true,
+      data: items[index],
+    });
+  });
+
+  // DELETE item
+  router.delete("/:id", (req, res) => {
+    let items = memoryStore[entity] || [];
+    const filtered = items.filter((i) => i._id !== req.params.id);
+
+    if (filtered.length === items.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Item not found",
+      });
+    }
+
+    memoryStore[entity] = filtered;
+
+    res.json({
+      success: true,
+      message: "Item deleted",
+    });
+  });
+
+  return router;
+};
+
+// Current schema (in-memory)
+let currentSchema = {
+  record: {
+    users: {
+      route: "/api/users",
+      backend: {
+        schema: {
+          name: { type: "String", required: true },
+          email: { type: "String", required: true },
+          phone: { type: "String" },
+        },
+      },
+      frontend: {
+        fields: [
+          { name: "name", label: "Name", required: true, type: "text" },
+          { name: "email", label: "Email", required: true, type: "email" },
+          { name: "phone", label: "Phone", type: "text" },
+        ],
+        columns: [
+          { header: "Name", accessor: "name" },
+          { header: "Email", accessor: "email" },
+          { header: "Phone", accessor: "phone" },
+        ],
+      },
+    },
+  },
+};
+
+// Register initial routes
+const registeredRoutes = {};
+Object.entries(currentSchema.record).forEach(([entity, config]) => {
+  const router = createRoutes(entity, config.backend.schema);
+  app.use(config.route, router);
+  registeredRoutes[entity] = router;
+  console.log(`✅ Registered route: ${config.route}`);
+});
+
+// ============================================
+// SYSTEM ROUTES
+// ============================================
+
+app.get("/", (req, res) => {
+  res.json({
+    message: "Dynamic Form System Backend",
+    status: "running",
+    version: "1.0.0",
+    database: isMongoConnected ? "connected" : "in-memory",
+    entities: Object.keys(currentSchema.record),
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    database: isMongoConnected ? "connected" : "in-memory",
+    entities: Object.keys(currentSchema.record).length,
+  });
+});
+
+app.get("/api/schema", (req, res) => {
+  res.json({
+    success: true,
+    data: currentSchema,
+  });
+});
+
+app.post("/api/schema/update", (req, res) => {
+  try {
+    const newSchema = req.body;
+
+    // Basic validation
+    if (!newSchema.record || typeof newSchema.record !== "object") {
+      throw new Error('Schema must contain a "record" object');
+    }
+
+    // Update schema
+    currentSchema = newSchema;
+
+    // Re-register routes
+    Object.values(registeredRoutes).forEach((route) => {
+      // Remove old routes (simplified)
+      // In a real app, you'd need to properly manage route removal
+    });
+
+    Object.entries(newSchema.record).forEach(([entity, config]) => {
+      if (!registeredRoutes[entity]) {
+        const router = createRoutes(entity, config.backend.schema);
+        app.use(config.route, router);
+        registeredRoutes[entity] = router;
+        console.log(`✅ Registered new route: ${config.route}`);
+      }
+    });
+
+    res.json({
+      success: true,
+      message: "Schema updated successfully",
+      entities: Object.keys(newSchema.record),
+    });
+  } catch (error) {
+    console.error("Error updating schema:", error);
+    res.status(400).json({
+      success: false,
+      error: error.message,
+    });
   }
 });
 
-/* ---------- 404 ---------- */
+// ============================================
+// ERROR HANDLING
+// ============================================
+
+// 404 handler
 app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
+  res.status(404).json({
+    success: false,
+    error: "Route not found",
+    availableRoutes: Object.values(currentSchema.record).map((c) => c.route),
+  });
 });
 
-export default app;
+// Error handler
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({
+    success: false,
+    error: "Internal server error",
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log("\n════════════════════════════════════════");
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log(`💾 Database: ${isMongoConnected ? "MongoDB" : "In-memory"}`);
+  console.log(`📋 Entities: ${Object.keys(currentSchema.record).join(", ")}`);
+  console.log("════════════════════════════════════════\n");
+});

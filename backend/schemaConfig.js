@@ -106,12 +106,6 @@ export default {
             type: "text",
           },
           {
-            name: "sku",
-            label: "SKU",
-            required: true,
-            type: "text",
-          },
-          {
             name: "quantity",
             label: "Quantity",
             required: true,
@@ -127,7 +121,6 @@ export default {
         columns: [
           { header: "ID", accessor: "id" },
           { header: "Product Name", accessor: "productName" },
-          { header: "SKU", accessor: "sku" },
           { header: "Quantity", accessor: "quantity" },
           { header: "Warehouse Location", accessor: "warehouseLocation" },
         ],
