@@ -1,183 +1,124 @@
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
-import bodyParser from "body-parser";
 
 const app = express();
 
-/* -------------------- Middleware -------------------- */
+/* ---------- Middleware ---------- */
+app.use(express.json({ limit: "50mb" }));
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "*",
-    credentials: true,
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE"],
   })
 );
 
-app.use(bodyParser.json({ limit: "50mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
+/* ---------- MongoDB (Vercel Safe) ---------- */
+const MONGODB_URI = process.env.MONGODB_URI;
 
-/* -------------------- Logging -------------------- */
-if (process.env.NODE_ENV !== "production") {
-  app.use((req, res, next) => {
-    console.log(`${req.method} ${req.path}`);
-    next();
-  });
+if (!MONGODB_URI) {
+  throw new Error("❌ MONGODB_URI missing");
 }
 
-/* -------------------- MongoDB -------------------- */
-const MONGODB_URI = process.env.MONGODB_URI;
-let isConnected = false;
+let cached = global.mongoose;
 
-const connectDB = async () => {
-  if (isConnected) return;
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
 
-  if (!MONGODB_URI) {
-    throw new Error("MONGODB_URI is not defined");
+async function connectDB() {
+  if (cached.conn) return cached.conn;
+
+  if (!cached.promise) {
+    cached.promise = mongoose.connect(MONGODB_URI, {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 5000,
+    });
   }
 
-  const db = await mongoose.connect(MONGODB_URI, {
-    bufferCommands: false,
-    serverSelectionTimeoutMS: 5000,
-  });
-
-  isConnected = db.connections[0].readyState === 1;
+  cached.conn = await cached.promise;
   console.log("✅ MongoDB connected");
-};
+  return cached.conn;
+}
 
-/* -------------------- Schema Config -------------------- */
-let schemaConfig = {
-  record: {
-    customers: {
-      route: "/api/customers",
-      backend: {
-        schema: {
-          name: { type: "String", required: true },
-          email: { type: "String", required: true, unique: true },
-          phone: { type: "String" },
-        },
-      },
-    },
+/* ---------- USER SCHEMA ---------- */
+const userSchema = new mongoose.Schema(
+  {
+    username: { type: String, required: true },
+    email: { type: String, required: true, unique: true },
+    role: { type: String, required: true },
   },
-};
+  { timestamps: true }
+);
 
-/* -------------------- Model Cache -------------------- */
-const modelCache = {};
+const User = mongoose.models.User || mongoose.model("User", userSchema);
 
-/* -------------------- Model Creator -------------------- */
-const createModel = (entityName, config) => {
-  const modelName = entityName.charAt(0).toUpperCase() + entityName.slice(1);
-
-  if (modelCache[modelName]) return modelCache[modelName];
-
-  if (mongoose.models[modelName]) delete mongoose.models[modelName];
-
-  const schemaFields = {};
-
-  for (const [field, cfg] of Object.entries(config.schema)) {
-    const fieldDef = { type: String };
-
-    if (cfg.type === "Number") fieldDef.type = Number;
-    if (cfg.type === "Boolean") fieldDef.type = Boolean;
-    if (cfg.type === "Date") fieldDef.type = Date;
-    if (cfg.type === "Array") fieldDef.type = Array;
-
-    if (cfg.required) fieldDef.required = true;
-    if (cfg.unique) fieldDef.unique = true;
-    if (cfg.default === "Date.now") fieldDef.default = Date.now;
-
-    schemaFields[field] = fieldDef;
+/* ---------- ROUTES ---------- */
+app.get("/api/users", async (req, res) => {
+  try {
+    await connectDB();
+    const users = await User.find().lean();
+    res.json({ success: true, data: users });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  const schema = new mongoose.Schema(schemaFields, {
-    timestamps: true,
-    strict: false,
-  });
-
-  const model = mongoose.model(modelName, schema);
-  modelCache[modelName] = model;
-  return model;
-};
-
-/* -------------------- Routes Creator -------------------- */
-const createRoutes = (entity, config, Model) => {
-  const router = express.Router();
-
-  router.get("/", async (req, res) => {
-    try {
-      await connectDB();
-      const data = await Model.find().lean();
-      res.json({ success: true, data });
-    } catch (e) {
-      res.status(500).json({ success: false, error: e.message });
-    }
-  });
-
-  router.post("/", async (req, res) => {
-    try {
-      await connectDB();
-      const doc = await Model.create(req.body);
-      res.status(201).json({ success: true, data: doc });
-    } catch (e) {
-      res.status(400).json({ success: false, error: e.message });
-    }
-  });
-
-  // Add the missing PUT route for updates
-  router.put("/:id", async (req, res) => {
-    try {
-      await connectDB();
-      const doc = await Model.findByIdAndUpdate(req.params.id, req.body, {
-        new: true,
-        runValidators: true,
-      });
-      if (!doc) {
-        return res.status(404).json({ success: false, error: "Not found" });
-      }
-      res.json({ success: true, data: doc });
-    } catch (e) {
-      res.status(400).json({ success: false, error: e.message });
-    }
-  });
-
-  return router;
-};
-
-/* -------------------- Register Routes -------------------- */
-Object.entries(schemaConfig.record).forEach(([name, cfg]) => {
-  const Model = createModel(name, cfg.backend);
-  app.use(cfg.route, createRoutes(name, cfg.backend, Model));
-  console.log(`✅ Registered route: ${cfg.route}`);
 });
 
-/* -------------------- System Routes -------------------- */
-app.get("/", (req, res) => {
-  res.json({ status: "running", message: "Dynamic Forms API" });
+app.post("/api/users", async (req, res) => {
+  try {
+    await connectDB();
+    const user = await User.create(req.body);
+    res.status(201).json({ success: true, data: user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
+app.put("/api/users/:id", async (req, res) => {
+  try {
+    await connectDB();
+    const user = await User.findByIdAndUpdate(req.params.id, req.body, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({ success: true, data: user });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/users/:id", async (req, res) => {
+  try {
+    await connectDB();
+    await User.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ---------- Health ---------- */
 app.get("/health", async (req, res) => {
   try {
     await connectDB();
     res.json({
       status: "OK",
       db: "connected",
-      timestamp: new Date().toISOString(),
+      time: new Date().toISOString(),
     });
   } catch (e) {
     res.status(503).json({ status: "ERROR", error: e.message });
   }
 });
 
-/* -------------------- Error Handling -------------------- */
-app.use((req, res, next) => {
+/* ---------- 404 ---------- */
+app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
 
-app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  res
-    .status(500)
-    .json({ error: "Internal server error", message: err.message });
-});
-
-/* -------------------- Export for Vercel -------------------- */
 export default app;
